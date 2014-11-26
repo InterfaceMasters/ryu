@@ -1,4 +1,6 @@
 # Copyright (C) 2011 Nippon Telegraph and Telephone Corporation.
+# Interface Masters Technologies, Inc. 2014.
+# Vitaliy Ivanov
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,50 +22,179 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
+from ryu.lib.packet import vlan
 
+"""
+SimpleSwitch13 to work with OF-DPA pipeline.
 
+Broadcom's OpenFlow Data Plane Abstraction (OF-DPA) has custom
+abstract switch processing pipeline. Hence, classic SimpleSwitch13 is not
+working with OF-DPA based switch.
+This version of SimpleSwitch13 is an attempt to modify controller software
+to work with OF-DPA.
+"""
 class SimpleSwitch13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
+        """
+        SimpleSwitch13 constructor.
+        """
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
+        print "SimpleSwitch13 initialization..."
         self.mac_to_port = {}
+        self.l2_intf_groups = []
+        self.l2_flood_group_counter = 1
+        self.l2_flood_group = None
+
+    def send_msg(self, datapath, msg):
+        """
+        Send Message thru datapath routine.
+        """
+        msg.xid = None
+        datapath.set_xid(msg)
+        datapath.send_msg(msg)
+        return msg.xid
+
+    def get_ofdpa_l2_interface_group_id(self, vlan, port):
+        """
+        Get OF-DPA L2 Interface group id routine.
+        """
+        return int("0x000%x%04x" % (vlan, port), 16)
+
+    def get_ofdpa_l2_flood_group_id(self, vlan, in_id):
+        """
+        Get OF-DPA L2 Flood group id routine.
+        """
+        return int("0x400%x%04x" % (vlan, in_id), 16)
+
+    def add_ports_to_vlan(self, datapath, ports, vlan):
+        """
+        Add vlan flow table filtering rules for all ports in vlan.
+        """
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        for port in ports:
+            match = parser.OFPMatch(vlan_vid=(int("1%03x" % vlan, 16), 8191), in_port=port)
+
+            inst = []
+            actions = []
+            actions.append(parser.OFPActionSetField(vlan_vid=1))
+            inst.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
+
+            inst.append(parser.OFPInstructionGotoTable(20))
+
+            # Installing flows to Vlan table.
+            mod = parser.OFPFlowMod(datapath=datapath, table_id=10, priority=0,
+                                    match=match, instructions=inst)
+            datapath.send_msg(mod)
+
+    def add_l2_interface_groups_for_vlan(self, datapath, ports, vlan):
+        """
+        Add L2 Interface groups for all ports in vlan.
+        """
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        for port in ports:
+            actions = [parser.OFPActionOutput(port, ofproto.OFPCML_NO_BUFFER)]
+
+            weight = 0
+            watch_port = ofproto.OFPP_ANY
+            watch_group = ofproto.OFPP_ANY
+            buckets = [parser.OFPBucket(weight, watch_port, watch_group, actions)]
+
+            group_id = self.get_ofdpa_l2_interface_group_id(vlan, port)
+            self.l2_intf_groups.append(group_id)
+            req = parser.OFPGroupMod(datapath, ofproto.OFPFC_ADD, ofproto.OFPGT_INDIRECT, group_id, buckets)
+            datapath.send_msg(req)
+
+    def add_l2_flood_group_for_vlan(self, datapath, vlan):
+        """
+        Add L2 Flood group for vlan.
+        """
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        weight = 0
+        watch_port = ofproto.OFPP_ANY
+        watch_group = ofproto.OFPP_ANY
+
+        group_id = self.get_ofdpa_l2_flood_group_id(vlan, self.l2_flood_group_counter)
+        self.l2_flood_group = group_id
+
+        buckets = []
+        for l2_intf_group in self.l2_intf_groups:
+            actions = [parser.OFPActionGroup(l2_intf_group)]
+            buckets.append(parser.OFPBucket(weight, watch_port, watch_group, actions))
+
+        req = parser.OFPGroupMod(datapath, ofproto.OFPFC_ADD, ofproto.OFPGT_ALL, group_id, buckets)
+        datapath.send_msg(req)
+        self.l2_flood_group_counter += 1
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
+        """
+        OF switch features dispatcher.
+        """
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # install table-miss flow entry
-        #
-        # We specify NO BUFFER to max_len of the output action due to
-        # OVS bug. At this moment, if we specify a lesser number, e.g.,
-        # 128, OVS will send Packet-In with invalid buffer_id and
-        # truncated packet data. In that case, we cannot output packets
-        # correctly.  The bug has been fixed in OVS v2.1.0.
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
+        req = parser.OFPPortDescStatsRequest(datapath, 0)
+        datapath.send_msg(req)
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handler(self, ev):
+        """
+        OF port desc stats dispatcher.
+        """
+        datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        port_ids = []
 
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                             actions)]
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
-                                    instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst)
+        for p in ev.msg.body:
+            port_ids.append(p.port_no)
+        self.logger.debug('OFPPortDescStatsReply received: %s', port_ids)
+
+        # Add all ports to vlan 1
+        self.add_ports_to_vlan(datapath, port_ids, 1)
+
+        # Add all ports to L2 Interface groups in vlan 1.
+        self.add_l2_interface_groups_for_vlan(datapath, port_ids, 1)
+
+        # Add L2 Flood group and wire with all L2 Interface groups in vlan 1.
+        self.add_l2_flood_group_for_vlan(datapath, 1)
+
+        # Add Bridge Table miss flow entry to copy to Controller and to flood
+        inst = []
+        match = parser.OFPMatch(vlan_vid=1)
+
+        action_1 = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        inst_1 = parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, action_1)
+        inst.append(inst_1)
+
+        action_2 = [parser.OFPActionGroup(self.l2_flood_group)]
+        inst_2 = parser.OFPInstructionActions(ofproto.OFPIT_WRITE_ACTIONS, action_2)
+        inst.append(inst_2)
+
+        inst.append(parser.OFPInstructionGotoTable(60))
+
+        # Installing flows to Bridge table with priority 0.
+        mod = parser.OFPFlowMod(datapath=datapath, table_id=50, priority=0, match=match, instructions=inst)
         datapath.send_msg(mod)
+
+        # TODO: Switch is ready once all entries are installed.
+        #       Add barrier message to get last entry installed notification.
+        print "SimpleSwitch13 is ready..."
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
+        """
+        OF packet in dispatcher.
+        """
         # If you hit this you might want to increase
         # the "miss_send_length" of your switch
         if ev.msg.msg_len < ev.msg.total_len:
@@ -81,35 +212,54 @@ class SimpleSwitch13(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
 
+        in_vlan = 1
+        vl = pkt.get_protocol(vlan.vlan)
+        if vl is not None :
+            in_vlan = vl.vid
+
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
+        self.logger.info("packet in dpid:%s src_mac:%s dst_mac:%s in_port:%s", dpid, src, dst, in_port)
 
         # learn a mac address to avoid FLOOD next time.
         self.mac_to_port[dpid][src] = in_port
+
+        print "FDB Table:"
+        print self.mac_to_port
 
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:
             out_port = ofproto.OFPP_FLOOD
 
-        actions = [parser.OFPActionOutput(out_port)]
-
-        # install a flow to avoid packet_in next time
+        # install a flow to avoid packet_in next time with priority 1.
         if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            # verify if we have a valid buffer_id, if yes avoid to send both
-            # flow_mod & packet_out
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow(datapath, 1, match, actions)
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
+            print "Installing new flow entry to Bridging table: vlan:%s, mac:%s -> out_port:%s" % (in_vlan, dst, out_port)
+            # in -> out direction
+            group_id = self.get_ofdpa_l2_interface_group_id(in_vlan, out_port)
+            inst = []
+            match = parser.OFPMatch(vlan_vid=in_vlan, eth_dst=dst)
 
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
-        datapath.send_msg(out)
+            action_2 = [parser.OFPActionGroup(group_id)]
+            inst_2 = parser.OFPInstructionActions(ofproto.OFPIT_WRITE_ACTIONS, action_2)
+            inst.append(inst_2)
+            inst.append(parser.OFPInstructionGotoTable(60))
+
+            print "Installing new flow entry to Bridging table: vlan:%s, mac:%s -> out_port:%s" % (in_vlan, src, in_port)
+            # Installing flows to Bridge table.
+            mod = parser.OFPFlowMod(datapath=datapath, table_id=50, priority=1, match=match, instructions=inst)
+            datapath.send_msg(mod)
+            # out -> in direction
+            group_id = self.get_ofdpa_l2_interface_group_id(in_vlan, in_port)
+            inst = []
+            match = parser.OFPMatch(vlan_vid=in_vlan, eth_dst=src)
+
+            action_2 = [parser.OFPActionGroup(group_id)]
+            inst_2 = parser.OFPInstructionActions(ofproto.OFPIT_WRITE_ACTIONS, action_2)
+            inst.append(inst_2)
+            inst.append(parser.OFPInstructionGotoTable(60))
+
+            # Installing flows to Bridge table.
+            mod = parser.OFPFlowMod(datapath=datapath, table_id=50, priority=1, match=match, instructions=inst)
+            datapath.send_msg(mod)
